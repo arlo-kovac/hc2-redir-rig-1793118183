@@ -17,10 +17,9 @@ jobs:
     environment:
       name: github-pages
     steps:
-      - name: build a MALFORMED pages artifact (same repo, accepted id, unprocessable content)
+      - name: malformed pages artifact (same repo, valid id, unprocessable content)
         run: |
-          mkdir -p out
-          head -c 64 /dev/urandom > out/artifact.tar
+          mkdir -p out && head -c 64 /dev/urandom > out/artifact.tar
       - uses: actions/upload-artifact@v4
         with:
           name: github-pages
@@ -31,21 +30,41 @@ jobs:
           ARM: ${{ github.event.inputs.arm }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -o pipefail
           TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -r .value)
           echo "::add-mask::$TOKEN"
-          API="https://api.github.com/repos/$GITHUB_REPOSITORY/pages/deployments"
-          AID=$(curl -s -H "Authorization: token $GH_TOKEN" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" | jq -r '.artifacts[0].id')
+          R="https://api.github.com/repos/$GITHUB_REPOSITORY"
+          API="$R/pages/deployments"
+          AID=$(curl -s -H "Authorization: token $GH_TOKEN" "$R/actions/runs/$GITHUB_RUN_ID/artifacts" | jq -r '.artifacts[0].id')
           echo "ARM=$ARM artifact_id=$AID"
-          echo "AURL=$AURL"
-          echo "===== POST deployment ====="
-          curl -s -w '\nHTTP %{http_code}\n' -X POST -H "Authorization: token $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" "$API" \
-            -d "{\"artifact_id\":$AID,\"artifact_url\":\"$AURL\",\"pages_build_version\":\"$GITHUB_SHA\",\"oidc_token\":\"$TOKEN\",\"environment\":\"github-pages\"}"
-          echo "===== poll status ====="
-          for i in 1 2 3 4 5 6 7 8; do
+          [ "$AID" = "null" ] && { echo "SETUP FAIL: no artifact id"; exit 1; }
+
+          post() {
+            curl -s -o body.json -w '%{http_code}' -X POST -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" "$API" \
+              -d "{\"artifact_id\":$AID,\"artifact_url\":\"$AURL\",\"pages_build_version\":\"$GITHUB_SHA\",\"oidc_token\":\"$TOKEN\",\"environment\":\"github-pages\"}"
+          }
+
+          CODE=$(post); echo "attempt1 HTTP $CODE"; cat body.json
+          if [ "$CODE" != "200" ] && grep -q 'in progress deployment' body.json; then
+            STUCK=$(grep -oE 'cancel [0-9a-f]{40}' body.json | awk '{print $2}' | head -1)
+            echo "cancelling stuck deployment $STUCK"
+            curl -s -w '\ncancel HTTP %{http_code}\n' -X POST -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" "$API/$STUCK/cancel"
+            sleep 8
+            CODE=$(post); echo "attempt2 HTTP $CODE"; cat body.json
+          fi
+
+          # ===== PRECONDITION ASSERTED INLINE: a non-200 means this arm NEVER RAN =====
+          if [ "$CODE" != "200" ]; then
+            echo "::error::ARM $ARM COLUMN VOID -- deployment POST returned $CODE, the fetch never happened"
+            exit 1
+          fi
+          echo "PRECONDITION OK: deployment accepted (200) for arm $ARM"
+          for i in 1 2 3 4 5 6; do
             sleep 10
-            S=$(curl -s -H "Authorization: token $GH_TOKEN" \
-              "https://api.github.com/repos/$GITHUB_REPOSITORY/pages/deployment/status/$GITHUB_SHA")
-            echo "t=$((i*10))s :: $(echo "$S" | head -c 250)"
+            echo "t=$((i*10))s :: $(curl -s -H "Authorization: token $GH_TOKEN" "$R/pages/deployment/status/$GITHUB_SHA" | head -c 200)"
           done
+          echo "freeing the lock for the next arm"
+          curl -s -o /dev/null -X POST -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" "$API/$GITHUB_SHA/cancel"
