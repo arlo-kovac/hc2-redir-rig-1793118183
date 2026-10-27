@@ -61,10 +61,17 @@ jobs:
             exit 1
           fi
           echo "PRECONDITION OK: deployment accepted (200) for arm $ARM"
-          for i in 1 2 3 4 5 6; do
-            sleep 10
-            echo "t=$((i*10))s :: $(curl -s -H "Authorization: token $GH_TOKEN" "$R/pages/deployment/status/$GITHUB_SHA" | head -c 200)"
+          T0=$(date +%s)
+          LAST=""
+          for i in $(seq 1 90); do
+            sleep 2
+            S=$(curl -s -H "Authorization: token $GH_TOKEN" "$R/pages/deployment/status/$GITHUB_SHA" | jq -r '.status // ""')
+            if [ "$S" != "$LAST" ]; then
+              echo "TIMING arm=$ARM elapsed=$(( $(date +%s) - T0 ))s status=\"$S\""
+              LAST="$S"
+            fi
+            case "$S" in errored|failed|deployment_failed|succeed|succeeded) echo "TERMINAL arm=$ARM elapsed=$(( $(date +%s) - T0 ))s status=$S"; break;; esac
           done
-          echo "freeing the lock for the next arm"
+          echo "FINAL arm=$ARM elapsed=$(( $(date +%s) - T0 ))s status=$LAST"
           curl -s -o /dev/null -X POST -H "Authorization: token $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" "$API/$GITHUB_SHA/cancel"
