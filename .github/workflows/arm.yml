@@ -1,0 +1,51 @@
+name: arm
+on:
+  workflow_dispatch:
+    inputs:
+      aurl:
+        required: true
+      arm:
+        required: true
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  actions: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+    steps:
+      - name: build a MALFORMED pages artifact (same repo, accepted id, unprocessable content)
+        run: |
+          mkdir -p out
+          head -c 64 /dev/urandom > out/artifact.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: github-pages
+          path: out/artifact.tar
+      - name: fire one arm
+        env:
+          AURL: ${{ github.event.inputs.aurl }}
+          ARM: ${{ github.event.inputs.arm }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -r .value)
+          echo "::add-mask::$TOKEN"
+          API="https://api.github.com/repos/$GITHUB_REPOSITORY/pages/deployments"
+          AID=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" | jq -r '.artifacts[0].id')
+          echo "ARM=$ARM artifact_id=$AID"
+          echo "AURL=$AURL"
+          echo "===== POST deployment ====="
+          curl -s -w '\nHTTP %{http_code}\n' -X POST -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" "$API" \
+            -d "{\"artifact_id\":$AID,\"artifact_url\":\"$AURL\",\"pages_build_version\":\"$GITHUB_SHA\",\"oidc_token\":\"$TOKEN\",\"environment\":\"github-pages\"}"
+          echo "===== poll status ====="
+          for i in 1 2 3 4 5 6 7 8; do
+            sleep 10
+            S=$(curl -s -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/pages/deployment/status/$GITHUB_SHA")
+            echo "t=$((i*10))s :: $(echo "$S" | head -c 250)"
+          done
